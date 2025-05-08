@@ -42,15 +42,33 @@
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_control_mode.hpp>
+#include <px4_msgs/msg/vehicle_odometry.hpp>
+#include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/u_int32.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/qos.hpp>  // for SensorDataQoS
 #include <stdint.h>
-
+#include <vector>
+#include <array>
+#include <cmath>
+#include <functional>
 #include <chrono>
 #include <iostream>
+#include <fstream>
+
 
 using namespace std::chrono;
 using namespace std::chrono_literals;
 using namespace px4_msgs::msg;
+
+// custom waypoints out in class
+const std::vector<std::array<float, 3>> Waypoints = {
+    {10.0f, 0.0f, -5.0f},
+    {10.0f, 10.0f, -5.0f},
+    {0.0f, 10.0f, -5.0f},
+    {0.0f, 0.0f, -5.0f},
+	{0.0f, 0.0f, 0.0f}
+};
 
 class OffboardControl : public rclcpp::Node
 {
@@ -61,8 +79,17 @@ public:
 		offboard_control_mode_publisher_ = this->create_publisher<OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
 		trajectory_setpoint_publisher_ = this->create_publisher<TrajectorySetpoint>("/fmu/in/trajectory_setpoint", 10);
 		vehicle_command_publisher_ = this->create_publisher<VehicleCommand>("/fmu/in/vehicle_command", 10);
-
+		odometry_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>("/fmu/out/vehicle_odometry",
+			rclcpp::SensorDataQoS(),  
+			std::bind(&OffboardControl::odometry_callback, this, std::placeholders::_1)
+		);
 		offboard_setpoint_counter_ = 0;
+		dist_publisher_ = this->create_publisher<std_msgs::msg::Float32>("/debug/dist", 10);
+		wp_index_publisher_ = this->create_publisher<std_msgs::msg::UInt32>("/debug/current_wp", 10);
+
+		csv_file_.open("flight_log.csv", std::ios::out);
+	    	csv_file_ << "time,pos_x,pos_y,pos_z,set_x,set_y,set_z\n";
+
 
 		auto timer_callback = [this]() -> void {
 
@@ -77,14 +104,17 @@ public:
 			// offboard_control_mode needs to be paired with trajectory_setpoint
 			publish_offboard_control_mode();
 			publish_trajectory_setpoint();
+			waypoint_counter();
 
 			// stop the counter after reaching 11
 			if (offboard_setpoint_counter_ < 11) {
 				offboard_setpoint_counter_++;
 			}
+
 		};
 		timer_ = this->create_wall_timer(100ms, timer_callback);
 	}
+	~OffboardControl() override { if (csv_file_.is_open()) {csv_file_.close();}}
 
 	void arm();
 	void disarm();
@@ -95,15 +125,66 @@ private:
 	rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_publisher_;
 	rclcpp::Publisher<TrajectorySetpoint>::SharedPtr trajectory_setpoint_publisher_;
 	rclcpp::Publisher<VehicleCommand>::SharedPtr vehicle_command_publisher_;
+	rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odometry_sub_;
+	px4_msgs::msg::VehicleOdometry current_odom_;
 
-	std::atomic<uint64_t> timestamp_;   //!< common synced timestamped
+	rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr dist_publisher_;
+	rclcpp::Publisher<std_msgs::msg::UInt32>::SharedPtr wp_index_publisher_;
+
+
+	
 
 	uint64_t offboard_setpoint_counter_;   //!< counter for the number of setpoints sent
 
 	void publish_offboard_control_mode();
 	void publish_trajectory_setpoint();
 	void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0);
+	void waypoint_counter();
+	void odometry_callback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg);
+
+	size_t max_wp_count_ = Waypoints.size(); 
+	size_t current_wp_count_ = 0; 
+	std::ofstream csv_file_;
 };
+
+/**
+ * @brief Counting waypoints
+ */
+ void OffboardControl::waypoint_counter()
+ {
+	 if (current_wp_count_ >= max_wp_count_) {
+		 return;  
+	 }
+ 
+	 const auto& wp = Waypoints[current_wp_count_];
+	 float dx = current_odom_.position[0] - wp[0];
+	 float dy = current_odom_.position[1] - wp[1];
+	 float dz = current_odom_.position[2] - wp[2];
+	 float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+ 
+	// publish distance
+	std_msgs::msg::Float32 dist_msg;
+	dist_msg.data = dist;
+	dist_publisher_->publish(dist_msg);
+
+	// publish current waypoint index
+	std_msgs::msg::UInt32 wp_msg;
+	wp_msg.data = static_cast<uint32_t>(current_wp_count_);
+	wp_index_publisher_->publish(wp_msg);
+
+	 if (dist < 0.5f) {
+		 if (current_wp_count_ < max_wp_count_ - 1) {
+			 current_wp_count_++;
+			 RCLCPP_INFO(this->get_logger(), "Reached waypoint. Advancing to [%zu]", current_wp_count_);
+		 } else {
+			 RCLCPP_INFO(this->get_logger(), "Final waypoint reached. Holding position.");
+		 }
+	 }
+ }
+ 
+ void OffboardControl::odometry_callback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg) {
+	current_odom_ = *msg;
+  }
 
 /**
  * @brief Send a command to Arm the vehicle
@@ -146,14 +227,30 @@ void OffboardControl::publish_offboard_control_mode()
  *        For this example, it sends a trajectory setpoint to make the
  *        vehicle hover at 5 meters with a yaw angle of 180 degrees.
  */
-void OffboardControl::publish_trajectory_setpoint()
-{
-	TrajectorySetpoint msg{};
-	msg.position = {0.0, 0.0, -5.0};
-	msg.yaw = -3.14; // [-PI:PI]
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	trajectory_setpoint_publisher_->publish(msg);
-}
+ void OffboardControl::publish_trajectory_setpoint()
+ { 
+	 auto wp = Waypoints[current_wp_count_];
+ 
+	 TrajectorySetpoint msg{};
+	 msg.position = {wp[0], wp[1], wp[2]};
+	 msg.yaw = 0.0f;  
+	 msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
+ 
+	 trajectory_setpoint_publisher_->publish(msg);
+ 
+	 RCLCPP_INFO(this->get_logger(), "Sent waypoint [%zu]: (%.2f, %.2f, %.2f)",
+	 current_wp_count_, wp[0], wp[1], wp[2]);
+	 
+	 csv_file_ << this->get_clock()->now().nanoseconds() << ","  // nanoseconds
+	 << current_odom_.position[0] << ","
+	 << current_odom_.position[1] << ","
+	 << current_odom_.position[2] << ","
+	 << wp[0] << "," << wp[1] << "," << wp[2] << "\n";
+
+	csv_file_.flush();
+
+
+ }
 
 /**
  * @brief Publish vehicle commands
